@@ -53,6 +53,8 @@
 use core::mem::MaybeUninit;
 use core::pin::Pin;
 
+use crate::move_ref::DropFlag;
+use crate::move_ref::ForgetTrap;
 use crate::move_ref::MoveRef;
 use crate::new;
 use crate::new::New;
@@ -67,7 +69,10 @@ use alloc::boxed::Box;
 /// `Slot`'s storage is allocated on.
 ///
 /// See [`slot!()`].
-pub struct Slot<'frame, T>(&'frame mut MaybeUninit<T>);
+pub struct Slot<'frame, T> {
+  ptr: &'frame mut MaybeUninit<T>,
+  trap: &'frame mut ForgetTrap,
+}
 
 impl<'frame, T> Slot<'frame, T> {
   /// Creates a new `Slot` with the given pointer as its basis.
@@ -76,14 +81,20 @@ impl<'frame, T> Slot<'frame, T> {
   ///
   /// # Safety
   /// `ptr` must not be outlived by any other pointers to its allocation.
-  pub unsafe fn new_unchecked(ptr: &'frame mut MaybeUninit<T>) -> Self {
-    Self(ptr)
+  ///
+  /// `trap` must point to a `ForgetTrap` defined in the same scope as `*ptr`;
+  /// otherwise the trap might spring too late.
+  pub unsafe fn new_unchecked(
+    ptr: &'frame mut MaybeUninit<T>,
+    trap: &'frame mut ForgetTrap,
+  ) -> Self {
+    Self { ptr, trap }
   }
 
   /// Put `val` into this slot, returning a new [`MoveRef`].
   pub fn put(self, val: T) -> MoveRef<'frame, T> {
-    *self.0 = MaybeUninit::new(val);
-    unsafe { MoveRef::new_unchecked(&mut *(self.0 as *mut _ as *mut T)) }
+    self.trap.arm();
+    unsafe { MoveRef::new_unchecked(self.ptr.write(val), self.trap.flag()) }
   }
 
   /// Pin `val` into this slot, returning a new, pinned [`MoveRef`].
@@ -94,9 +105,11 @@ impl<'frame, T> Slot<'frame, T> {
   /// Emplace `new` into this slot, returning a new, pinned [`MoveRef`].
   pub fn emplace<N: New<Output = T>>(self, new: N) -> Pin<MoveRef<'frame, T>> {
     unsafe {
-      new.new(Pin::new_unchecked(self.0));
+      self.trap.arm();
+      new.new(Pin::new_unchecked(self.ptr));
       Pin::new_unchecked(MoveRef::new_unchecked(
-        &mut *(self.0 as *mut _ as *mut T),
+        &mut *(self.ptr as *mut _ as *mut T),
+        self.trap.flag(),
       ))
     }
   }
@@ -107,9 +120,15 @@ impl<'frame, T> Slot<'frame, T> {
     new: N,
   ) -> Result<Pin<MoveRef<'frame, T>>, N::Error> {
     unsafe {
-      new.try_new(Pin::new_unchecked(self.0))?;
+      self.trap.arm();
+      new.try_new(Pin::new_unchecked(self.ptr)).map_err(|e| {
+        // Disarm the trap if we're exiting early.
+        *self.trap.flag() = DropFlag::Dead;
+        e
+      })?;
       Ok(Pin::new_unchecked(MoveRef::new_unchecked(
-        &mut *(self.0 as *mut _ as *mut T),
+        &mut *(self.ptr as *mut _ as *mut T),
+        self.trap.flag(),
       )))
     }
   }
@@ -139,8 +158,11 @@ macro_rules! slot {
     let mut uninit = $crate::slot::__macro::core::mem::MaybeUninit::<
       $crate::slot!(@tyof $($ty)?)
     >::uninit();
+    let mut trap = $crate::move_ref::ForgetTrap::new();
     #[allow(unsafe_code, unused_unsafe)]
-    let $name = unsafe { $crate::slot::Slot::new_unchecked(&mut uninit) };
+    let $name = unsafe {
+      $crate::slot::Slot::new_unchecked(&mut uninit, &mut trap)
+    };
   )*};
   (@tyof) => {_};
   (@tyof $ty:ty) => {$ty};
